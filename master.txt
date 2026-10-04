@@ -1,0 +1,562 @@
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+
+// ====================== WI-FI & UDP CONFIG ======================
+const char* WIFI_SSID = "Kvetena";
+const char* WIFI_PASS = "soso1234";
+const uint16_t UDP_PORT = 8888;
+WiFiUDP udp;
+
+// ====================== TOUCH PINS (CYD) ======================
+#define XPT2046_IRQ  36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK  25
+#define XPT2046_CS   33
+
+#define TS_MIN_X 200
+#define TS_MAX_X 3700
+#define TS_MIN_Y 240
+#define TS_MAX_Y 3800
+
+// Dedicated SPI bus instance for CYD Touch hardware
+SPIClass touchSpi = SPIClass(VSPI);
+XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
+TFT_eSPI tft = TFT_eSPI();
+
+// ====================== SYSTEM STATES ======================
+enum AppState {
+  STATE_MENU,
+  STATE_BUCKET_CONFIG,
+  STATE_RESULT_VIEW,
+  STATE_DRAWING
+};
+AppState currentState = STATE_MENU;
+
+// ====================== SORTING MODES ======================
+enum SortMode {
+  MODE_COLOR = 0,
+  MODE_SHAPE,
+  MODE_BOTH
+};
+SortMode sortMode = MODE_COLOR;
+
+// ====================== COLORS, SHAPES, SIZES ======================
+enum ObjectColor { COLOR_RED = 0, COLOR_GREEN, COLOR_BLUE, COLOR_YELLOW };
+enum ObjectShape { SHAPE_CIRCLE = 0, SHAPE_TRIANGLE, SHAPE_RECTANGLE };
+enum RectSize    { SIZE_SMALL = 0, SIZE_MEDIUM, SIZE_LARGE };
+
+const uint16_t colorRGB[4] = { TFT_RED, TFT_GREEN, TFT_BLUE, TFT_YELLOW };
+const char* colorName[4]   = { "RED", "GREEN", "BLUE", "YELLOW" };
+const char* shapeName[3]   = { "CIRC", "TRI", "RECT" };
+const char* sizeName[3]    = { "S", "M", "L" };
+
+// ====================== BUCKET CONFIG ======================
+#define NUM_BUCKETS 4
+struct Bucket {
+  ObjectColor color = COLOR_RED;
+  ObjectShape shape = SHAPE_CIRCLE;
+  RectSize    size  = SIZE_SMALL;
+};
+Bucket buckets[NUM_BUCKETS];
+
+// Live Sorting Result variables
+String lastDetectedColor = "NONE";
+String lastDetectedShape = "NONE";
+int lastTargetBucket = 0;
+
+// ====================== TOUCH DEBOUNCE & LONG PRESS ======================
+unsigned long lastTouchTime = 0;
+const int TOUCH_DEBOUNCE = 150;
+const int LONG_PRESS_TIME = 600;
+
+// Forward Declarations
+void drawAnalyticsBar();
+void drawMenu();
+void drawBucketConfig();
+void drawResultScreen();
+void drawDrawingScreen();
+
+// ====================== TOUCH HELPERS ======================
+bool getTouch(int &x, int &y) {
+  if (ts.touched()) {
+    TS_Point p = ts.getPoint();
+    x = map(p.x, TS_MIN_X, TS_MAX_X, 0, tft.width());
+    y = map(p.y, TS_MIN_Y, TS_MAX_Y, 0, tft.height());
+    x = constrain(x, 0, tft.width());
+    y = constrain(y, 0, tft.height());
+    return true;
+  }
+  return false;
+}
+
+// ====================== WIRELESS CONFIG SENDER ======================
+void sendConfigToMainESP32() {
+  String payload = "CFG," + String((int)sortMode);
+  for (int i = 0; i < NUM_BUCKETS; i++) {
+    payload += "," + String((int)buckets[i].color) + "," + String((int)buckets[i].shape);
+  }
+  
+  // Print to USB Serial Monitor
+  Serial.print("\n[MASTER TX] Broadcasting New Config Payload: ");
+  Serial.println(payload);
+
+  // Send wirelessly via UDP broadcast
+  udp.beginPacket(IPAddress(255, 255, 255, 255), UDP_PORT);
+  udp.print(payload);
+  udp.endPacket();
+}
+
+void parseIncomingResult(String data) {
+  if (!data.startsWith("RES,")) return;
+  
+  Serial.print("[MASTER RX] Received Live Result: ");
+  Serial.println(data);
+
+  data.remove(0, 4);
+  int c1 = data.indexOf(',');
+  int c2 = data.indexOf(',', c1 + 1);
+  
+  if (c1 != -1 && c2 != -1) {
+    lastDetectedColor = data.substring(0, c1);
+    lastDetectedShape = data.substring(c1 + 1, c2);
+    lastTargetBucket  = data.substring(c2 + 1).toInt();
+  }
+}
+
+// ====================== ANALYTICS BAR ======================
+void drawAnalyticsBar() {
+  tft.fillRect(0, 216, 320, 24, TFT_DARKGREY);
+  tft.setTextSize(1);
+
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  tft.setCursor(2, 218);
+  const char* modeStr = (sortMode == MODE_COLOR) ? "CLR" :
+                        (sortMode == MODE_SHAPE) ? "SHP" : "BTH";
+  tft.printf("M:%s", modeStr);
+
+  tft.setCursor(60, 218);
+  tft.setTextColor(TFT_YELLOW, TFT_DARKGREY);
+  tft.printf("C:%s S:%s", lastDetectedColor.c_str(), lastDetectedShape.c_str());
+
+  tft.setCursor(220, 218);
+  if (lastTargetBucket > 0) {
+    tft.setTextColor(TFT_GREEN, TFT_DARKGREY);
+    tft.printf("BKT: #%d", lastTargetBucket);
+  } else {
+    tft.setTextColor(TFT_RED, TFT_DARKGREY);
+    tft.print("BKT: NONE");
+  }
+}
+
+// ====================== MENU SCREEN ======================
+void drawMenu() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(1);
+
+  tft.fillRect(0, 0, 320, 24, TFT_NAVY);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setCursor(80, 5); tft.print("SORTING SYSTEM");
+
+  const int btnW = 150, btnH = 40, margin = 10;
+  int x1 = margin, x2 = 320 - margin - btnW;
+  int yOff = 30;
+
+  tft.fillRect(x1, yOff, btnW, btnH, TFT_RED);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.setCursor(x1+30, yOff+12); tft.print("COLOR SORT");
+
+  tft.fillRect(x2, yOff, btnW, btnH, TFT_GREEN);
+  tft.setTextColor(TFT_WHITE, TFT_GREEN);
+  tft.setCursor(x2+30, yOff+12); tft.print("SHAPE SORT");
+
+  yOff += btnH + margin;
+  tft.fillRect(x1, yOff, btnW, btnH, TFT_BLUE);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.setCursor(x1+35, yOff+12); tft.print("BOTH SORT");
+
+  tft.fillRect(x2, yOff, btnW, btnH, TFT_DARKCYAN);
+  tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+  tft.setCursor(x2+25, yOff+12); tft.print("SORT RESULTS");
+
+  yOff += btnH + margin;
+  tft.fillRect(x1, yOff, btnW, btnH, TFT_PURPLE);
+  tft.setTextColor(TFT_WHITE, TFT_PURPLE);
+  tft.setCursor(x1+25, yOff+12); tft.print("DRAWING");
+
+  drawAnalyticsBar();
+}
+
+// ====================== BUCKET CONFIG SCREEN ======================
+void drawBucketConfig() {
+  tft.fillScreen(TFT_BLACK);
+
+  tft.fillRect(0, 0, 320, 24, TFT_NAVY);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setTextSize(1);
+  tft.setCursor(5, 5);
+  const char* modeStr = (sortMode == MODE_COLOR) ? "COLOR SORT" :
+                        (sortMode == MODE_SHAPE) ? "SHAPE SORT" : "BOTH SORT";
+  tft.print(modeStr);
+  tft.setCursor(220, 5);
+  tft.print("[DONE]");
+
+  const int boxW = 140, boxH = 80;
+  const int marginX = 15, marginY = 30;
+  int cols[4] = {marginX, 320 - marginX - boxW, marginX, 320 - marginX - boxW};
+  int rows[4] = {marginY, marginY, marginY + boxH + 10, marginY + boxH + 10};
+
+  for (int i = 0; i < NUM_BUCKETS; i++) {
+    int x = cols[i], y = rows[i];
+    tft.drawRect(x, y, boxW, boxH, TFT_WHITE);
+    uint16_t fillColor = colorRGB[buckets[i].color];
+    tft.fillRect(x+2, y+2, boxW-4, boxH-4, fillColor);
+
+    tft.setTextColor(TFT_WHITE, fillColor);
+    tft.setCursor(x+5, y+5);
+    tft.print("B"); tft.print(i+1);
+
+    int cx = x + boxW - 25, cy = y + 15;
+    if (buckets[i].shape == SHAPE_CIRCLE) {
+      tft.fillCircle(cx, cy, 10, TFT_BLACK);
+    } else if (buckets[i].shape == SHAPE_TRIANGLE) {
+      tft.fillTriangle(cx, cy-10, cx-10, cy+8, cx+10, cy+8, TFT_BLACK);
+    } else { 
+      int w = 24, h = 16;
+      if (buckets[i].size == SIZE_SMALL)        { w = 16; h = 10; }
+      else if (buckets[i].size == SIZE_MEDIUM){ w = 24; h = 16; }
+      else                                     { w = 30; h = 20; }
+      tft.fillRect(cx - w/2, cy - h/2, w, h, TFT_BLACK);
+    }
+
+    if (buckets[i].shape == SHAPE_RECTANGLE) {
+      tft.setTextColor(TFT_BLACK, fillColor);
+      tft.setCursor(cx - 6, cy + 12);
+      tft.print(sizeName[buckets[i].size]);
+    }
+
+    if (sortMode == MODE_BOTH) {
+      tft.setTextColor(TFT_BLACK, fillColor);
+      tft.setCursor(x+5, y+boxH-15);
+      tft.print(shapeName[buckets[i].shape]);
+      if (buckets[i].shape == SHAPE_RECTANGLE) {
+        tft.print(":");
+        tft.print(sizeName[buckets[i].size]);
+      }
+    }
+  }
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(5, 205);
+  if (sortMode == MODE_COLOR) {
+    tft.print("Tap bucket -> cycle color");
+  } else if (sortMode == MODE_SHAPE) {
+    tft.print("Tap bucket -> cycle shape");
+  } else {
+    tft.print("Tap -> color, Long-press -> shape");
+  }
+
+  drawAnalyticsBar();
+}
+
+void handleBucketTouch(int tx, int ty, bool longPress) {
+  const int boxW = 140, boxH = 80;
+  const int marginX = 15, marginY = 30;
+  int cols[4] = {marginX, 320 - marginX - boxW, marginX, 320 - marginX - boxW};
+  int rows[4] = {marginY, marginY, marginY + boxH + 10, marginY + boxH + 10};
+
+  for (int i = 0; i < NUM_BUCKETS; i++) {
+    if (tx > cols[i] && tx < cols[i]+boxW && ty > rows[i] && ty < rows[i]+boxH) {
+      if (sortMode == MODE_COLOR) {
+        buckets[i].color = (ObjectColor)((buckets[i].color + 1) % 4);
+      }
+      else if (sortMode == MODE_SHAPE) {
+        if (buckets[i].shape == SHAPE_RECTANGLE) {
+          buckets[i].size = (RectSize)((buckets[i].size + 1) % 3);
+          if (buckets[i].size == SIZE_SMALL) {
+            buckets[i].shape = (ObjectShape)((buckets[i].shape + 1) % 3);
+          }
+        } else {
+          buckets[i].shape = (ObjectShape)((buckets[i].shape + 1) % 3);
+        }
+      }
+      else { 
+        if (longPress) {
+          if (buckets[i].shape == SHAPE_RECTANGLE) {
+            buckets[i].size = (RectSize)((buckets[i].size + 1) % 3);
+            if (buckets[i].size == SIZE_SMALL) {
+              buckets[i].shape = (ObjectShape)((buckets[i].shape + 1) % 3);
+            }
+          } else {
+            buckets[i].shape = (ObjectShape)((buckets[i].shape + 1) % 3);
+          }
+        } else {
+          buckets[i].color = (ObjectColor)((buckets[i].color + 1) % 4);
+        }
+      }
+      drawBucketConfig();
+      return;
+    }
+  }
+}
+
+// ====================== RESULT VIEW SCREEN ======================
+void drawResultScreen() {
+  tft.fillScreen(TFT_BLACK);
+  tft.fillRect(0, 0, 320, 30, TFT_NAVY);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setTextSize(2);
+  tft.setCursor(40, 6);
+  tft.print("SORTING LIVE FEED");
+
+  tft.drawRect(10, 45, 300, 155, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+
+  tft.setCursor(20, 60);
+  tft.print("DETECTED COLOR:");
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setCursor(200, 60);
+  tft.print(lastDetectedColor);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(20, 100);
+  tft.print("DETECTED SHAPE:");
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(200, 100);
+  tft.print(lastDetectedShape);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(20, 145);
+  tft.print("TARGET BUCKET :");
+  
+  if (lastTargetBucket > 0) {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setCursor(200, 145);
+    tft.printf("BUCKET %d", lastTargetBucket);
+  } else {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(200, 145);
+    tft.print("NO MATCH");
+  }
+
+  drawAnalyticsBar();
+}
+
+// ====================== DRAWING GAME ======================
+uint16_t brushColor = TFT_GREEN;
+int prevDrawX = -1, prevDrawY = -1;
+
+const int PALETTE_COUNT = 9;
+uint16_t palette[PALETTE_COUNT] = {
+  TFT_RED, TFT_GREEN, TFT_BLUE, TFT_YELLOW,
+  TFT_CYAN, TFT_MAGENTA, TFT_ORANGE, TFT_WHITE, TFT_BLACK
+};
+
+void drawDrawingScreen() {
+  tft.fillRect(0, 0, 320, 36, TFT_NAVY);
+  tft.drawFastHLine(0, 36, 320, TFT_WHITE);
+
+  tft.fillRect(4, 4, 60, 28, TFT_DARKGREY);
+  tft.drawRect(4, 4, 60, 28, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  tft.setCursor(12, 12); tft.print("< MENU");
+
+  tft.fillRect(70, 4, 55, 28, TFT_MAROON);
+  tft.drawRect(70, 4, 55, 28, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_MAROON);
+  tft.setCursor(80, 12); tft.print("CLR");
+
+  int swatchSize = 24;
+  int startX = 135;
+  for (int i = 0; i < PALETTE_COUNT; i++) {
+    tft.fillRect(startX + i*swatchSize, 6, swatchSize-2, swatchSize-2, palette[i]);
+    if (brushColor == palette[i]) {
+      tft.drawRect(startX + i*swatchSize, 6, swatchSize-2, swatchSize-2, TFT_BLACK);
+    }
+  }
+}
+
+// ====================== SETUP ======================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(21, OUTPUT); 
+  digitalWrite(21, HIGH); // Backlight
+  
+  tft.init();
+  tft.invertDisplay(true); // Fixed: Uses the official TFT_eSPI function for register inversion
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  // Initialize CYD Touch hardware with dedicated SPI instance
+  touchSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  ts.begin(touchSpi);
+  ts.setRotation(1);
+
+  // Connect to Wi-Fi
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(10, 100);
+  tft.print("Connecting Wi-Fi...");
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("\n[MASTER] Wi-Fi Connected!");
+  Serial.print("[MASTER] IP: "); Serial.println(WiFi.localIP());
+
+  udp.begin(UDP_PORT);
+  drawMenu();
+}
+
+// ====================== MAIN LOOP ======================
+void loop() {
+  // Check for wireless UDP messages from Slave ESP32
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    char buf[255];
+    int len = udp.read(buf, 255);
+    if (len > 0) buf[len] = 0;
+    
+    String incoming = String(buf);
+    incoming.trim();
+    parseIncomingResult(incoming);
+    
+    if (currentState == STATE_RESULT_VIEW) {
+      drawResultScreen();
+    } else {
+      drawAnalyticsBar();
+    }
+  }
+
+  int tx, ty;
+  bool touched = getTouch(tx, ty); 
+
+  static bool pressing = false;
+  static unsigned long pressStart = 0;
+  bool longPress = false;
+
+  if (touched) {
+    if (!pressing) {
+      pressing = true;
+      pressStart = millis();
+    } else if (millis() - pressStart > LONG_PRESS_TIME) {
+      longPress = true;
+    }
+  } else {
+    pressing = false;
+  }
+
+  static bool lastTouched = false;
+  bool touchEnd = lastTouched && !touched;
+  lastTouched = touched;
+
+  if (touchEnd) {
+    if (millis() - lastTouchTime < TOUCH_DEBOUNCE) return;
+    lastTouchTime = millis();
+
+    bool longAction = (millis() - pressStart > LONG_PRESS_TIME);
+
+    switch (currentState) {
+      case STATE_MENU: {
+        const int btnW = 150, btnH = 40, margin = 10;
+        int x1 = margin, x2 = 320 - margin - btnW;
+        int y1 = 30, y2 = y1 + btnH + margin, y3 = y2 + btnH + margin;
+
+        if (tx > x1 && tx < x1+btnW && ty > y1 && ty < y1+btnH) {
+          sortMode = MODE_COLOR;
+          currentState = STATE_BUCKET_CONFIG;
+          drawBucketConfig();
+        } else if (tx > x2 && tx < x2+btnW && ty > y1 && ty < y1+btnH) {
+          sortMode = MODE_SHAPE;
+          currentState = STATE_BUCKET_CONFIG;
+          drawBucketConfig();
+        } else if (tx > x1 && tx < x1+btnW && ty > y2 && ty < y2+btnH) {
+          sortMode = MODE_BOTH;
+          currentState = STATE_BUCKET_CONFIG;
+          drawBucketConfig();
+        } else if (tx > x2 && tx < x2+btnW && ty > y2 && ty < y2+btnH) {
+          currentState = STATE_RESULT_VIEW;
+          drawResultScreen();
+        } else if (tx > x1 && tx < x1+btnW && ty > y3 && ty < y3+btnH) {
+          currentState = STATE_DRAWING;
+          drawDrawingScreen();
+          prevDrawX = prevDrawY = -1;
+        }
+        break;
+      }
+
+      case STATE_BUCKET_CONFIG: {
+        if (tx > 200 && ty < 24) {
+          sendConfigToMainESP32();
+          currentState = STATE_MENU;
+          drawMenu();
+        } else {
+          handleBucketTouch(tx, ty, longAction);
+        }
+        break;
+      }
+
+      case STATE_RESULT_VIEW: {
+        currentState = STATE_MENU;
+        drawMenu();
+        break;
+      }
+
+      case STATE_DRAWING: {
+        if (ty <= 36) {
+          if (tx >= 4 && tx <= 64) {
+            currentState = STATE_MENU;
+            drawMenu();
+          } else if (tx >= 70 && tx <= 125) {
+            tft.fillRect(0, 37, 320, 203, TFT_BLACK);
+          } else {
+            int swatchSize = 24, startX = 135;
+            for (int i = 0; i < PALETTE_COUNT; i++) {
+              if (tx >= startX + i*swatchSize && tx <= startX + i*swatchSize + swatchSize-2) {
+                brushColor = palette[i];
+                drawDrawingScreen();
+                break;
+              }
+            }
+          }
+          prevDrawX = prevDrawY = -1;
+        } else {
+          if (prevDrawX > 0 && prevDrawY > 36) {
+            tft.drawLine(prevDrawX, prevDrawY, tx, ty, brushColor);
+            tft.fillCircle(tx, ty, 2, brushColor);
+          } else {
+            tft.fillCircle(tx, ty, 2, brushColor);
+          }
+          prevDrawX = tx;
+          prevDrawY = ty;
+        }
+        break;
+      }
+    }
+  }
+
+  if (currentState == STATE_DRAWING && touched && !longPress) {
+    if (ty > 36) {
+      if (prevDrawX > 0 && prevDrawY > 36) {
+        tft.drawLine(prevDrawX, prevDrawY, tx, ty, brushColor);
+        tft.fillCircle(tx, ty, 2, brushColor);
+      } else {
+        tft.fillCircle(tx, ty, 2, brushColor);
+      }
+      prevDrawX = tx;
+      prevDrawY = ty;
+    }
+  }
+
+  delay(5);
+}
